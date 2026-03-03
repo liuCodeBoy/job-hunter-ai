@@ -61,10 +61,25 @@ def run(config_path: str, skip_crawl: bool = False, skip_push: bool = False):
         seen_ids = set(
             row[0] for row in conn.execute("SELECT id FROM jobs").fetchall()
         )
+        # 检查每日限额
+        today_count = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE created_at >= date('now')"
+        ).fetchone()[0]
         conn.close()
 
-        new_jobs = crawl(config, db_path, seen_ids)
-        log.info(f"抓取完成，新增 {len(new_jobs)} 个岗位")
+        daily_limit = config.get("search", {}).get("daily_limit", 30)
+        if today_count >= daily_limit:
+            log.warning(f"今日已抓取 {today_count} 个岗位，达到每日上限 {daily_limit}，跳过抓取")
+            new_jobs = []
+        else:
+            # 动态调整本次最大抓取数，不超过每日限额
+            remaining = daily_limit - today_count
+            config["search"]["max_jobs"] = min(
+                config["search"].get("max_jobs", 15), remaining
+            )
+            log.info(f"今日已抓取 {today_count} 个，本次最多抓 {config['search']['max_jobs']} 个")
+            new_jobs = crawl(config, db_path, seen_ids)
+            log.info(f"抓取完成，新增 {len(new_jobs)} 个岗位")
 
         if not new_jobs:
             log.info("没有新岗位，退出")
