@@ -81,13 +81,65 @@ def save_cookies(driver, cookie_path):
         log.warning(f"保存 Cookie 失败: {e}")
 
 
-def create_driver(headless=False):
+def find_chromedriver():
+    """查找 chromedriver，优先用项目根目录的"""
+    # 从当前脚本往上找 4 层到项目根目录
+    base = Path(__file__).resolve().parents[3]
+    candidates = [
+        base / "chromedriver.exe",
+        base / "chromedriver",
+        Path("chromedriver.exe"),
+        Path("chromedriver"),
+    ]
+    for p in candidates:
+        if p.exists():
+            log.info(f"使用 chromedriver: {p}")
+            return str(p)
+    return None
+
+
+def create_driver():
     options = uc.ChromeOptions()
     options.add_argument("--window-size=1280,800")
     options.add_argument("--lang=zh-CN")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    # undetected_chromedriver 不支持真正的 headless（会被检测），始终用有头模式
-    driver = uc.Chrome(options=options, headless=False)
+    # 新版 Selenium 删掉了 ChromeOptions.headless 属性，但旧版 uc 内部会访问它
+    # 手动补上，避免 AttributeError
+    if not hasattr(options, 'headless'):
+        options.headless = False
+
+    # 完全跳过 uc 的网络检查，直接用本地 chromedriver
+    import undetected_chromedriver.patcher as patcher_mod
+    from distutils.version import LooseVersion
+    import shutil
+
+    # 找本地 chromedriver 路径
+    driver_path = find_chromedriver()
+    uc_cache = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "undetected_chromedriver", "chromedriver.exe")
+
+    # patch auto() 直接跳过下载，用已有文件
+    def _patched_auto(self, executable=True, required_version=False, no_ssl=False):
+        # 如果缓存已有 chromedriver，直接 patch 后用
+        if os.path.exists(uc_cache):
+            self.executable_path = uc_cache
+            self.patch_exe()
+            return
+        # 否则用项目根目录的
+        if driver_path and os.path.exists(driver_path):
+            dst = uc_cache
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy(driver_path, dst)
+            self.executable_path = dst
+            self.patch_exe()
+            return
+        raise RuntimeError("找不到 chromedriver，请确保 chromedriver.exe 在项目根目录")
+
+    patcher_mod.Patcher.auto = _patched_auto
+
+    driver = uc.Chrome(
+        options=options,
+        headless=False,
+        version_main=145,
+    )
     return driver
 
 
