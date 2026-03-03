@@ -1,6 +1,11 @@
 """
 analyze.py - JD 分析 + 简历匹配
-调用 OpenClaw Agent（LLM）对岗位进行深度分析
+调用 LLM 对岗位进行深度分析
+
+LLM 配置优先级（从高到低）：
+  1. 环境变量 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+  2. config.yaml 中的 llm 配置项
+  3. ~/.openclaw/openclaw.json（OpenClaw 用户专用）
 """
 
 import json
@@ -81,42 +86,75 @@ ANALYZE_PROMPT_WITH_RESUME = """你是一个资深 HR 顾问，请对以下岗�
 只输出 JSON，不要其他内容。"""
 
 
-def _load_openclaw_llm_config() -> dict:
-    """从 openclaw.json 读取 LLM 配置"""
-    import json, os
+def _load_llm_config(app_config: dict = None) -> dict:
+    """
+    加载 LLM 配置，优先级：
+    1. 环境变量 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+    2. config.yaml 中的 llm 配置项（通过 app_config 传入）
+    3. ~/.openclaw/openclaw.json（OpenClaw 用户专用）
+    """
+    # 1. 环境变量
+    env_key = os.environ.get("LLM_API_KEY", "")
+    if env_key:
+        return {
+            "api_key":  env_key,
+            "base_url": os.environ.get("LLM_BASE_URL", "https://api.anthropic.com"),
+            "model":    os.environ.get("LLM_MODEL", "claude-3-5-sonnet-20241022"),
+        }
+
+    # 2. config.yaml 中的 llm 配置
+    if app_config:
+        llm_cfg = app_config.get("llm", {})
+        if llm_cfg.get("api_key"):
+            return {
+                "api_key":  llm_cfg["api_key"],
+                "base_url": llm_cfg.get("base_url", "https://api.anthropic.com"),
+                "model":    llm_cfg.get("model", "claude-3-5-sonnet-20241022"),
+            }
+
+    # 3. ~/.openclaw/openclaw.json（兜底）
     config_path = os.path.expanduser("~/.openclaw/openclaw.json")
     try:
         with open(config_path, encoding="utf-8") as f:
             d = json.load(f)
         pp = d.get("models", {}).get("providers", {}).get("ppinfra", {})
-        model_full = d.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
-        # model_full 格式: ppinfra/pa/claude-sonnet-4-6 → 去掉第一段 provider 前缀
+        model_full = (
+            d.get("agents", {})
+             .get("defaults", {})
+             .get("model", {})
+             .get("primary", "")
+        )
         parts = model_full.split("/")
         model_name = "/".join(parts[1:]) if len(parts) > 1 else model_full
-        return {
-            "base_url": pp.get("baseUrl", ""),
-            "api_key": pp.get("apiKey", ""),
-            "model": model_name or "claude-sonnet-4-6",
-        }
-    except Exception as e:
-        log.warning(f"读取 openclaw 配置失败: {e}")
-        return {}
+        if pp.get("apiKey"):
+            return {
+                "api_key":  pp["apiKey"],
+                "base_url": pp.get("baseUrl", ""),
+                "model":    model_name or "claude-sonnet-4-6",
+            }
+    except Exception:
+        pass
+
+    return {}
 
 
-def call_llm(prompt: str) -> str:
-    """
-    调用 LLM（Anthropic SDK，从 openclaw.json 读取配置）
-    """
-    cfg = _load_openclaw_llm_config()
+def call_llm(prompt: str, app_config: dict = None) -> str:
+    """调用 LLM，返回文本"""
+    cfg = _load_llm_config(app_config)
     if not cfg.get("api_key"):
-        log.error("未找到 LLM API Key，请在 openclaw.json 中配置 ppinfra provider")
+        log.error(
+            "未找到 LLM API Key，请通过以下任一方式配置：\n"
+            "  1. 环境变量：export LLM_API_KEY=sk-xxx\n"
+            "  2. config.yaml 中添加 llm.api_key\n"
+            "  3. 安装 OpenClaw 并配置 ppinfra provider"
+        )
         return ""
 
     try:
         import anthropic
         client = anthropic.Anthropic(
             api_key=cfg["api_key"],
-            base_url=cfg["base_url"],
+            base_url=cfg["base_url"] or None,
         )
         message = client.messages.create(
             model=cfg["model"],
@@ -131,13 +169,11 @@ def call_llm(prompt: str) -> str:
 
 def extract_json(text: str) -> dict:
     """从 LLM 输出中提取 JSON"""
-    # 尝试直接解析
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # 提取 ```json ... ``` 代码块
     match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
     if match:
         try:
@@ -145,7 +181,6 @@ def extract_json(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    # 提取第一个 { ... }
     match = re.search(r'\{.*\}', text, re.DOTALL)
     if match:
         try:
@@ -157,14 +192,11 @@ def extract_json(text: str) -> dict:
     return {}
 
 
-def analyze_job(job: dict, resume: str = "") -> dict:
-    """
-    分析单个岗位
-    返回分析结果 dict，包含 score 和 analysis JSON
-    """
+def analyze_job(job: dict, resume: str = "", app_config: dict = None) -> dict:
+    """分析单个岗位，返回 {score, analysis}"""
     description = job.get("description", "")
     if not description:
-        log.warning(f"岗位无 JD 描述，跳过分析: {job['title']}")
+        log.warning(f"岗位无 JD 描述，跳过分析: {job.get('title', '')}")
         return {"score": 50, "analysis": "{}"}
 
     if resume:
@@ -174,7 +206,7 @@ def analyze_job(job: dict, resume: str = "") -> dict:
             salary=job.get("salary", ""),
             experience=job.get("experience", ""),
             degree=job.get("degree", ""),
-            description=description[:3000],  # 限制长度
+            description=description[:3000],
             resume=resume[:2000],
         )
     else:
@@ -188,7 +220,7 @@ def analyze_job(job: dict, resume: str = "") -> dict:
         )
 
     log.info(f"分析岗位: {job['title']} @ {job['company']}")
-    raw = call_llm(prompt)
+    raw = call_llm(prompt, app_config)
     result = extract_json(raw)
 
     score = result.get("score", 50)
@@ -210,18 +242,18 @@ def load_resume(resume_path: str) -> str:
         return f.read().strip()
 
 
-def batch_analyze(jobs: list, resume_path: str = "") -> list:
+def batch_analyze(jobs: list, resume_path: str = "", app_config: dict = None) -> list:
     """批量分析岗位列表"""
     resume = load_resume(resume_path)
     if resume:
-        log.info(f"已加载简历，将进行匹配评分")
+        log.info("已加载简历，将进行匹配评分")
     else:
         log.info("未找到简历，仅做岗位质量评分")
 
     results = []
     for job in jobs:
         try:
-            result = analyze_job(job, resume)
+            result = analyze_job(job, resume, app_config)
             job["score"] = result["score"]
             job["analysis"] = result["analysis"]
         except Exception as e:

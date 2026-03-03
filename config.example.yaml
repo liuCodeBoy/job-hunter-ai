@@ -35,3 +35,12 @@ crawler:
   headless: true        # 无头模式（true=后台运行，false=显示浏览器窗口）
   timeout: 30           # 页面加载超时（秒）
   delay: 2              # 每次请求间隔（秒），太小容易被封
+
+# ── LLM 配置 ──────────────────────────────────────
+# 优先级：环境变量 > 此处配置 > ~/.openclaw/openclaw.json（OpenClaw 用户）
+# 支持任何兼容 Anthropic SDK 的服务（官方 Claude、ppinfra 中转等）
+llm:
+  api_key: ""           # API Key，留空则从环境变量 LLM_API_KEY 读取
+  base_url: ""          # API 地址，留空则使用官方 https://api.anthropic.com
+                        # ppinfra 中转：https://api.ppinfra.com/anthropic
+  model: "claude-3-5-sonnet-20241022"  # 模型名称
