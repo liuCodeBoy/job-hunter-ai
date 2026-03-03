@@ -1,24 +1,22 @@
 """
 crawl.py - Boss直聘岗位爬虫
-使用 undetected-chromedriver 绕过反爬检测
+使用 Playwright 实现
+支持平台：Windows / macOS / Linux（需要 Chrome 或 Chromium）
 """
 
-import time
-import json
+import os
 import re
 import sys
+import time
+import json
 import yaml
 import logging
 from pathlib import Path
 
 try:
-    import undetected_chromedriver as uc
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 except ImportError:
-    print("请先安装依赖: pip install undetected-chromedriver selenium")
+    print("请先安装依赖: pip install playwright && python -m playwright install chromium")
     sys.exit(1)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -26,63 +24,42 @@ log = logging.getLogger(__name__)
 
 # Boss直聘城市代码映射
 CITY_CODE = {
-    "全国": "100010000",
-    "北京": "101010100",
-    "上海": "101020100",
-    "广州": "101280100",
-    "深圳": "101280600",
-    "杭州": "101210100",
-    "成都": "101270100",
-    "南京": "101190100",
-    "武汉": "101200100",
-    "西安": "101110100",
-    "苏州": "101190400",
-    "杭州": "101210100",
-    "厦门": "101230200",
-    "重庆": "101040100",
-    "天津": "101030100",
-    "长沙": "101250100",
-}
-
-# 薪资范围代码
-SALARY_CODE = {
-    (0, 0):    "",
-    (0, 5):    "402",
-    (5, 10):   "403",
-    (10, 20):  "404",
-    (20, 50):  "405",
-    (50, 100): "406",
+    "全国":  "100010000",
+    "北京":  "101010100",
+    "上海":  "101020100",
+    "广州":  "101280100",
+    "深圳":  "101280600",
+    "杭州":  "101210100",
+    "成都":  "101270100",
+    "南京":  "101190100",
+    "武汉":  "101200100",
+    "西安":  "101110100",
+    "苏州":  "101190400",
+    "厦门":  "101230200",
+    "重庆":  "101040100",
+    "天津":  "101030100",
+    "长沙":  "101250100",
 }
 
 
 def get_salary_code(min_k: int, max_k: int) -> str:
     if min_k == 0 and max_k == 0:
         return ""
-    if max_k <= 5:
-        return "402"
-    elif max_k <= 10:
-        return "403"
-    elif max_k <= 20:
-        return "404"
-    elif max_k <= 50:
-        return "405"
-    else:
-        return "406"
+    if max_k <= 5:   return "402"
+    if max_k <= 10:  return "403"
+    if max_k <= 20:  return "404"
+    if max_k <= 50:  return "405"
+    return "406"
 
 
 def build_search_url(keyword: str, city: str, salary_min: int, salary_max: int,
                      experience: str, degree: str, page: int = 1) -> str:
     city_code = CITY_CODE.get(city, "101020100")
     salary_code = get_salary_code(salary_min, salary_max)
-
     exp_map = {"不限": "", "应届": "102", "1-3年": "103", "3-5年": "104", "5-10年": "105"}
     deg_map = {"不限": "", "大专": "203", "本科": "204", "硕士": "205", "博士": "206"}
 
-    params = [
-        f"query={keyword}",
-        f"city={city_code}",
-        f"page={page}",
-    ]
+    params = [f"query={keyword}", f"city={city_code}", f"page={page}"]
     if salary_code:
         params.append(f"salary={salary_code}")
     exp_code = exp_map.get(experience, "")
@@ -96,161 +73,217 @@ def build_search_url(keyword: str, city: str, salary_min: int, salary_max: int,
 
 
 def extract_job_id(url: str) -> str:
-    """从 Boss直聘岗位 URL 提取唯一 ID"""
-    match = re.search(r'/job_detail/([^/?]+)', url)
-    return match.group(1) if match else url
+    match = re.search(r'/job_detail/([^/?\.]+)', url)
+    return match.group(1) if match else re.sub(r'[^a-zA-Z0-9]', '_', url)[-32:]
 
 
-def create_driver(headless: bool = True) -> uc.Chrome:
-    options = uc.ChromeOptions()
-    if headless:
-        options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--lang=zh-CN")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-    driver = uc.Chrome(options=options)
-    return driver
-
-
-def wait_for_login(driver: uc.Chrome, timeout: int = 60):
-    """检测是否需要登录，等待用户手动登录"""
+def load_cookies(cookie_path: str) -> list:
+    if not cookie_path or not os.path.exists(cookie_path):
+        return []
     try:
-        # 检查是否有登录弹窗
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "dialog-container"))
+        with open(cookie_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_cookies(context, cookie_path: str):
+    try:
+        cookies = context.cookies()
+        os.makedirs(os.path.dirname(os.path.abspath(cookie_path)), exist_ok=True)
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, ensure_ascii=False, indent=2)
+        log.info(f"Cookie 已保存: {cookie_path}")
+    except Exception as e:
+        log.warning(f"保存 Cookie 失败: {e}")
+
+
+def is_login_required(page) -> bool:
+    """检测是否需要登录"""
+    try:
+        page.wait_for_selector(
+            ".login-dialog, .sign-dialog, [class*='login-wrap']",
+            timeout=3000
         )
-        log.warning("检测到登录弹窗，请在浏览器中手动登录（扫码或账号密码）...")
-        log.warning(f"等待最多 {timeout} 秒...")
-        WebDriverWait(driver, timeout).until(
-            EC.invisibility_of_element_located((By.CLASS_NAME, "dialog-container"))
+        return True
+    except PWTimeout:
+        return False
+
+
+def wait_manual_login(page, context, cookie_path: str, timeout_sec: int = 120):
+    """等待用户手动扫码登录"""
+    log.warning("=" * 55)
+    log.warning("⚠️  需要登录 Boss直聘，请在弹出的浏览器窗口中扫码")
+    log.warning(f"   等待最多 {timeout_sec} 秒...")
+    log.warning("=" * 55)
+    try:
+        page.wait_for_selector(
+            ".user-nav, .nav-user-info, [class*='user-avatar'], .user-info",
+            timeout=timeout_sec * 1000
         )
-        log.info("登录成功，继续抓取...")
+        log.info("✅ 登录成功！")
+        save_cookies(context, cookie_path)
         time.sleep(2)
-    except TimeoutException:
-        pass  # 没有登录弹窗，继续
+    except PWTimeout:
+        log.error("❌ 登录超时，请重新运行并及时扫码")
+        raise RuntimeError("登录超时")
 
 
-def parse_job_list(driver: uc.Chrome, url: str, delay: float = 2) -> list:
-    """解析岗位列表页，返回岗位基本信息列表"""
+def parse_job_list(page, url: str, delay: float = 2) -> list:
+    """解析岗位列表页"""
     jobs = []
-    driver.get(url)
-    time.sleep(delay)
-
-    # 检查登录状态
-    wait_for_login(driver)
-
     try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "job-list-box"))
-        )
-    except TimeoutException:
-        log.warning(f"页面加载超时或无岗位: {url}")
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        log.warning(f"页面加载失败: {e}")
         return jobs
 
+    time.sleep(delay)
+
     # 滚动加载
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-    time.sleep(1)
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(1)
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+    time.sleep(0.8)
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(0.8)
 
-    job_cards = driver.find_elements(By.CSS_SELECTOR, ".job-list-box .job-card-wrapper")
-    log.info(f"找到 {len(job_cards)} 个岗位卡片")
+    try:
+        page.wait_for_selector(".job-list-box", timeout=12000)
+    except PWTimeout:
+        log.warning(f"岗位列表未加载，可能需要登录或触发了风控: {url}")
+        return jobs
 
-    for card in job_cards:
+    cards = page.query_selector_all(".job-list-box .job-card-wrapper")
+    log.info(f"找到 {len(cards)} 个岗位卡片")
+
+    for card in cards:
         try:
-            title_el = card.find_element(By.CSS_SELECTOR, ".job-name")
-            company_el = card.find_element(By.CSS_SELECTOR, ".company-name")
-            salary_el = card.find_element(By.CSS_SELECTOR, ".salary")
-            info_els = card.find_elements(By.CSS_SELECTOR, ".job-info .tag-list li")
-            link_el = card.find_element(By.CSS_SELECTOR, "a.job-card-left")
+            title_el  = card.query_selector(".job-name")
+            company_el= card.query_selector(".company-name")
+            salary_el = card.query_selector(".salary")
+            link_el   = card.query_selector("a.job-card-left")
+            if not all([title_el, company_el, salary_el, link_el]):
+                continue
 
             href = link_el.get_attribute("href") or ""
-            job_id = extract_job_id(href)
+            if not href.startswith("http"):
+                href = "https://www.zhipin.com" + href
 
-            tags = [el.text.strip() for el in info_els]
+            tag_els = card.query_selector_all(".job-info .tag-list li")
+            tags = [el.inner_text().strip() for el in tag_els]
 
             jobs.append({
-                "id": job_id,
-                "title": title_el.text.strip(),
-                "company": company_el.text.strip(),
-                "salary": salary_el.text.strip(),
-                "tags": tags,
-                "url": href,
+                "id":          extract_job_id(href),
+                "title":       title_el.inner_text().strip(),
+                "company":     company_el.inner_text().strip(),
+                "salary":      salary_el.inner_text().strip(),
+                "tags":        tags,
+                "url":         href,
+                "experience":  tags[0] if len(tags) > 0 else "",
+                "degree":      tags[1] if len(tags) > 1 else "",
+                "city":        "",
+                "description": "",
             })
-        except NoSuchElementException:
-            continue
+        except Exception as e:
+            log.debug(f"解析卡片异常: {e}")
 
     return jobs
 
 
-def parse_job_detail(driver: uc.Chrome, job: dict, delay: float = 2) -> dict:
-    """抓取岗位详情页，补充 JD 描述"""
+def parse_job_detail(page, job: dict, delay: float = 2) -> dict:
+    """抓取岗位详情页"""
     if not job.get("url"):
         return job
-
     try:
-        driver.get(job["url"])
+        page.goto(job["url"], wait_until="domcontentloaded", timeout=30000)
         time.sleep(delay)
 
-        # JD 描述
         try:
-            desc_el = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CLASS_NAME, "job-detail-section"))
-            )
-            job["description"] = desc_el.text.strip()
-        except TimeoutException:
+            page.wait_for_selector(".job-detail-section", timeout=10000)
+            desc_el = page.query_selector(".job-detail-section")
+            job["description"] = desc_el.inner_text().strip() if desc_el else ""
+        except PWTimeout:
             job["description"] = ""
 
-        # 城市/经验/学历（从标签提取）
         try:
-            req_els = driver.find_elements(By.CSS_SELECTOR, ".job-detail-info .info-primary p")
-            for el in req_els:
-                text = el.text.strip()
-                if "年" in text or "经验" in text:
-                    job["experience"] = text
-                elif any(d in text for d in ["本科", "硕士", "大专", "博士", "学历"]):
-                    job["degree"] = text
-        except Exception:
-            pass
-
-        # 城市
-        try:
-            addr_el = driver.find_element(By.CSS_SELECTOR, ".job-detail-info .name")
-            job["city"] = addr_el.text.strip()
+            addr_el = page.query_selector(".job-detail-info .name")
+            if addr_el:
+                job["city"] = addr_el.inner_text().strip()
         except Exception:
             pass
 
     except Exception as e:
-        log.warning(f"抓取详情失败 {job['url']}: {e}")
-
+        log.warning(f"抓取详情失败 {job.get('url', '')}: {e}")
     return job
 
 
 def crawl(config: dict, db_path: str, seen_ids: set) -> list:
-    """
-    主爬虫入口
-    返回新抓取的岗位列表（已过滤历史重复）
-    """
-    search = config["search"]
+    """主爬虫入口，返回新抓取的岗位列表"""
+    search      = config["search"]
     crawler_cfg = config.get("crawler", {})
-    headless = crawler_cfg.get("headless", True)
-    delay = crawler_cfg.get("delay", 2)
-    max_jobs = search.get("max_jobs", 20)
+    headless    = crawler_cfg.get("headless", True)
+    delay       = crawler_cfg.get("delay", 2)
+    max_jobs    = search.get("max_jobs", 20)
+    cookie_path = os.path.join(os.path.dirname(db_path), "cookies.json")
 
-    driver = create_driver(headless=headless)
     new_jobs = []
 
-    try:
+    with sync_playwright() as p:
+        # 首次尝试无头模式
+        browser = p.chromium.launch(
+            headless=headless,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        context = browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            locale="zh-CN",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+        )
+
+        # 加载已保存的 Cookie
+        cookies = load_cookies(cookie_path)
+        if cookies:
+            context.add_cookies(cookies)
+            log.info(f"已加载 {len(cookies)} 条历史 Cookie")
+
+        page = context.new_page()
+        page.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
+
+        # 访问首页检查登录状态
+        page.goto("https://www.zhipin.com/web/geek/job", wait_until="domcontentloaded")
+        time.sleep(2)
+
+        if is_login_required(page):
+            log.info("未检测到登录态，切换到有头模式等待扫码...")
+            browser.close()
+            browser = p.chromium.launch(headless=False, args=["--no-sandbox"])
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                locale="zh-CN",
+            )
+            if cookies:
+                context.add_cookies(cookies)
+            page = context.new_page()
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            )
+            page.goto("https://www.zhipin.com/web/geek/job", wait_until="domcontentloaded")
+            time.sleep(2)
+
+            if is_login_required(page):
+                wait_manual_login(page, context, cookie_path)
+
+        # ── 开始抓取 ──────────────────────────────────
         for keyword in search["keywords"]:
             if len(new_jobs) >= max_jobs:
                 break
 
-            log.info(f"搜索关键词: {keyword}")
+            log.info(f"🔍 搜索: {keyword} | 城市: {search.get('city','上海')}")
             url = build_search_url(
                 keyword=keyword,
                 city=search.get("city", "上海"),
@@ -260,37 +293,37 @@ def crawl(config: dict, db_path: str, seen_ids: set) -> list:
                 degree=search.get("degree", "不限"),
             )
 
-            jobs = parse_job_list(driver, url, delay=delay)
+            jobs = parse_job_list(page, url, delay=delay)
 
             for job in jobs:
                 if len(new_jobs) >= max_jobs:
                     break
                 if job["id"] in seen_ids:
-                    log.debug(f"跳过已见岗位: {job['title']} @ {job['company']}")
                     continue
 
-                log.info(f"抓取详情: {job['title']} @ {job['company']}")
-                job = parse_job_detail(driver, job, delay=delay)
+                log.info(f"📄 {job['title']} @ {job['company']} ({job['salary']})")
+                job = parse_job_detail(page, job, delay=delay)
                 new_jobs.append(job)
                 seen_ids.add(job["id"])
 
             time.sleep(delay)
 
-    finally:
-        driver.quit()
+        # 保存最新 Cookie
+        save_cookies(context, cookie_path)
+        browser.close()
 
-    log.info(f"本次共抓取 {len(new_jobs)} 个新岗位")
+    log.info(f"✅ 本次抓取完成，新增 {len(new_jobs)} 个岗位")
     return new_jobs
 
 
 if __name__ == "__main__":
-    # 单独测试爬虫
     cfg_path = Path(__file__).parent.parent.parent.parent / "config.yaml"
     if not cfg_path.exists():
         cfg_path = cfg_path.with_name("config.example.yaml")
 
-    with open(cfg_path) as f:
+    with open(cfg_path, encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    os.makedirs("data", exist_ok=True)
     results = crawl(config, config["database"]["path"], set())
     print(json.dumps(results[:2], ensure_ascii=False, indent=2))
