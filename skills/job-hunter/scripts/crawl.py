@@ -2,19 +2,12 @@
 crawl.py - Boss直聘岗位爬虫
 通过 OpenClaw Browser 控制用户已登录的 Chrome 发 fetch 请求。
 
-运行方式：
-  本模块的 crawl() 需要传入一个 fetch_fn 回调（由 agent 注入）：
-    fetch_fn(url: str) -> dict
-
-  如果直接运行（agent 模式），请使用 agent_crawl() 替代，
-  它会通过 subprocess 调用 openclaw browser act。
+核心逻辑：搜索和拉详情必须在同一批次完成，因为 securityId 有时效性。
 """
 
-import os
 import time
 import json
 import logging
-import subprocess
 from urllib.parse import quote
 
 log = logging.getLogger(__name__)
@@ -27,8 +20,8 @@ CITY_CODE = {
     "重庆": "101040100", "天津": "101030100", "长沙": "101250100",
 }
 
-EXP_MAP  = {"不限": "", "应届": "102", "1-3年": "103", "3-5年": "104", "5-10年": "105"}
-DEG_MAP  = {"不限": "", "大专": "203", "本科": "204", "硕士": "205", "博士": "206"}
+EXP_MAP = {"不限": "", "应届": "102", "1-3年": "103", "3-5年": "104", "5-10年": "105"}
+DEG_MAP = {"不限": "", "大专": "203", "本科": "204", "硕士": "205", "博士": "206"}
 
 
 def get_salary_code(min_k, max_k):
@@ -58,39 +51,85 @@ def build_search_url(keyword, city, salary_min, salary_max, experience, degree, 
     return "/wapi/zpgeek/search/joblist.json?" + "&".join(params)
 
 
-def parse_job(raw):
-    tags = raw.get("skills", [])
-    return {
-        "id":          raw.get("encryptJobId", ""),
-        "title":       raw.get("jobName", ""),
-        "company":     raw.get("brandName", ""),
-        "salary":      raw.get("salaryDesc", ""),
-        "city":        raw.get("cityName", ""),
-        "experience":  raw.get("jobExperience", ""),
-        "degree":      raw.get("jobDegree", ""),
-        "description": "技术要求：" + "、".join(tags) if tags else "",
-        "url":         f"https://www.zhipin.com/job_detail/{raw.get('encryptJobId','')}.html",
-        "tags":        tags,
-    }
+# 一次性搜索 + 拉详情的 JS（securityId 在同一批次内使用，不会过期）
+BATCH_FETCH_JS = """
+(async () => {{
+  // Step1: 搜索
+  const searchResp = await fetch('{search_url}', {{credentials:'include'}});
+  const searchData = await searchResp.json();
+  if (searchData.code !== 0) return JSON.stringify({{error: searchData.message, jobs: []}});
+
+  const jobList = searchData.zpData.jobList || [];
+
+  // Step2: 并发拉详情（限制并发数避免触发频控）
+  const results = [];
+  for (let i = 0; i < jobList.length; i++) {{
+    const j = jobList[i];
+    try {{
+      const detailResp = await fetch(
+        '/wapi/zpgeek/job/detail.json?jobId=' + j.encryptJobId +
+        '&lid=' + encodeURIComponent(j.lid) +
+        '&securityId=' + encodeURIComponent(j.securityId),
+        {{credentials: 'include'}}
+      );
+      const detail = await detailResp.json();
+      const info = (detail.zpData && detail.zpData.jobInfo) || {{}};
+      const brand = (detail.zpData && detail.zpData.brandInfo) || {{}};
+      results.push({{
+        id: j.encryptJobId,
+        title: j.jobName,
+        company: j.brandName,
+        salary: j.salaryDesc,
+        city: j.cityName,
+        experience: j.jobExperience,
+        degree: j.jobDegree,
+        url: 'https://www.zhipin.com/job_detail/' + j.encryptJobId + '.html',
+        tags: j.skills || [],
+        description: info.postDescription || info.desc || '',
+        companySize: brand.brandScaleName || '',
+        companyStage: brand.brandStageName || '',
+        companyIndustry: j.brandIndustry || '',
+        welfare: j.welfareList || [],
+        areaDistrict: j.areaDistrict || '',
+        businessDistrict: j.businessDistrict || '',
+      }});
+    }} catch(e) {{
+      results.push({{
+        id: j.encryptJobId,
+        title: j.jobName,
+        company: j.brandName,
+        salary: j.salaryDesc,
+        city: j.cityName,
+        experience: j.jobExperience,
+        degree: j.jobDegree,
+        url: 'https://www.zhipin.com/job_detail/' + j.encryptJobId + '.html',
+        tags: j.skills || [],
+        description: (j.skills||[]).join('、'),
+        welfare: j.welfareList || [],
+      }});
+    }}
+    // 每3个请求暂停200ms，避免频控
+    if (i % 3 === 2) await new Promise(r => setTimeout(r, 200));
+  }}
+  return JSON.stringify({{jobs: results, total: searchData.zpData.resCount}});
+}})()
+"""
 
 
 def crawl(config: dict, db_path: str, seen_ids: set, fetch_fn=None) -> list:
     """
     主爬取函数。
-    fetch_fn: callable(url) -> dict，由调用方注入（agent 直接传 browser fetch）
-    如果为 None，则尝试通过 subprocess 调用 openclaw browser act。
+    fetch_fn: callable(js_code: str) -> str  执行 JS 并返回结果字符串
+              由 agent 注入（browser tool evaluate）
     """
-    search      = config["search"]
-    crawler_cfg = config.get("crawler", {})
-    delay       = crawler_cfg.get("delay", 2)
-    max_jobs    = search.get("max_jobs", 15)
-
     if fetch_fn is None:
-        fetch_fn = _make_subprocess_fetch()
-
-    if fetch_fn is None:
-        log.error("❌ 无法获取 fetch 函数，请确保 OpenClaw Browser Relay 已连接 Boss直聘标签页")
+        log.error("❌ fetch_fn 未注入，请通过 agent 调用（需要 OpenClaw Browser Relay）")
         return []
+
+    search = config["search"]
+    crawler_cfg = config.get("crawler", {})
+    delay = crawler_cfg.get("delay", 2)
+    max_jobs = search.get("max_jobs", 15)
 
     new_jobs = []
 
@@ -98,8 +137,9 @@ def crawl(config: dict, db_path: str, seen_ids: set, fetch_fn=None) -> list:
         if len(new_jobs) >= max_jobs:
             break
 
-        log.info(f"🔍 搜索: {keyword} | 城市: {search.get('city','上海')}")
-        url = build_search_url(
+        log.info(f"🔍 搜索: {keyword} | 城市: {search.get('city', '上海')}")
+
+        search_url = build_search_url(
             keyword=keyword,
             city=search.get("city", "上海"),
             salary_min=search.get("salary_min", 0),
@@ -108,21 +148,26 @@ def crawl(config: dict, db_path: str, seen_ids: set, fetch_fn=None) -> list:
             degree=search.get("degree", "不限"),
         )
 
-        time.sleep(delay)
-        data = fetch_fn(url)
+        js = BATCH_FETCH_JS.format(search_url=search_url)
 
-        if not data or data.get("code") != 0:
-            log.warning(f"搜索失败: {data.get('message','') if data else '无响应'}")
+        try:
+            result_str = fetch_fn(js)
+            data = json.loads(result_str) if isinstance(result_str, str) else result_str
+        except Exception as e:
+            log.error(f"执行 JS 失败: {e}")
             continue
 
-        job_list = data.get("zpData", {}).get("jobList", [])
-        log.info(f"  返回 {len(job_list)} 个岗位")
+        if data.get("error"):
+            log.warning(f"搜索失败: {data['error']}")
+            continue
 
-        for raw in job_list:
+        jobs = data.get("jobs", [])
+        log.info(f"  返回 {len(jobs)} 个岗位，共 {data.get('total', '?')} 个结果")
+
+        for job in jobs:
             if len(new_jobs) >= max_jobs:
                 break
-            job = parse_job(raw)
-            if not job["id"] or job["id"] in seen_ids:
+            if not job.get("id") or job["id"] in seen_ids:
                 continue
             log.info(f"  📄 {job['title']} @ {job['company']} ({job['salary']})")
             new_jobs.append(job)
@@ -132,42 +177,3 @@ def crawl(config: dict, db_path: str, seen_ids: set, fetch_fn=None) -> list:
 
     log.info(f"✅ 抓取完成，新增 {len(new_jobs)} 个岗位")
     return new_jobs
-
-
-def _make_subprocess_fetch():
-    """
-    通过 openclaw browser act 发 fetch（subprocess 方式，用于独立运行）
-    需要 OpenClaw relay 已连接 Boss直聘 tab。
-    """
-    # 找 target_id
-    try:
-        import requests as _req
-        r = _req.get("http://127.0.0.1:18792/json", timeout=3)
-        tabs = r.json() if isinstance(r.json(), list) else []
-        target_id = next(
-            (t["id"] for t in tabs if "zhipin.com" in t.get("url", "")),
-            tabs[0]["id"] if tabs else None
-        )
-    except Exception:
-        target_id = None
-
-    if not target_id:
-        return None
-
-    def fetch_fn(url):
-        js = f"fetch('{url}',{{credentials:'include'}}).then(r=>r.json()).then(d=>JSON.stringify(d))"
-        result = subprocess.run(
-            ["openclaw", "browser", "act", "--profile", "chrome",
-             "--target", target_id, "--eval", js],
-            capture_output=True, text=True, timeout=20
-        )
-        if result.returncode != 0:
-            return {}
-        try:
-            raw = result.stdout.strip()
-            if raw.startswith('"'): raw = json.loads(raw)
-            return json.loads(raw)
-        except Exception:
-            return {}
-
-    return fetch_fn
