@@ -178,11 +178,21 @@ def parse_job_list(page, url: str, delay: float = 2) -> list:
     handle_security_check(page)
     time.sleep(delay)
 
+    # 检查是否跳转到验证页
+    handle_security_check(page)
+
     # 先等岗位列表加载，再滚动
     try:
-        page.wait_for_selector(".job-list-box", timeout=12000)
+        page.wait_for_selector(".job-list-box", timeout=15000)
     except PWTimeout:
-        log.warning(f"岗位列表未加载，可能需要登录或触发了风控: {url}")
+        log.warning(f"岗位列表未加载: {page.url}")
+        # 截图保存方便排查
+        try:
+            os.makedirs("data", exist_ok=True)
+            page.screenshot(path="data/debug_screenshot.png")
+            log.info("已保存截图到 data/debug_screenshot.png")
+        except Exception:
+            pass
         return jobs
 
     # 滚动加载更多（页面稳定后）
@@ -334,8 +344,15 @@ def crawl(config: dict, db_path: str, seen_ids: set) -> list:
 
             wait_manual_login(page, context, cookie_path)
 
-        # 登录后等一下让页面稳定
+        # 登录后模拟正常用户行为：先在首页停留一会儿
+        log.info("登录成功，预热中，请稍候...")
+        page.goto("https://www.zhipin.com/", wait_until="domcontentloaded")
         time.sleep(3)
+        # 随机滚动一下，模拟真实用户
+        page.evaluate("window.scrollTo(0, 300)")
+        time.sleep(2)
+        page.evaluate("window.scrollTo(0, 0)")
+        time.sleep(2)
 
         # ── 开始抓取 ──────────────────────────────────
         for keyword in search["keywords"]:
