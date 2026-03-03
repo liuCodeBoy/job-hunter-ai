@@ -113,6 +113,16 @@ def is_login_required(page) -> bool:
 
 def wait_manual_login(page, context, cookie_path: str, timeout_sec: int = 180):
     """等待用户手动登录（扫码或账号密码）"""
+    # 先跳转到登录页
+    try:
+        page.goto("https://www.zhipin.com/web/user/?ka=header-login", wait_until="domcontentloaded", timeout=15000)
+        time.sleep(2)
+    except Exception:
+        try:
+            page.goto("https://www.zhipin.com/", wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+
     log.warning("=" * 55)
     log.warning("⚠️  请在弹出的浏览器窗口中登录 Boss直聘")
     log.warning("   支持微信扫码 / 手机验证码 / 账号密码")
@@ -120,7 +130,7 @@ def wait_manual_login(page, context, cookie_path: str, timeout_sec: int = 180):
     log.warning("=" * 55)
     try:
         page.wait_for_selector(
-            ".nav-user-info, .user-nav, [class*='user-avatar'], .geek-nav",
+            ".nav-user-info, .user-nav, [class*='user-avatar'], .geek-nav, .user-info",
             timeout=timeout_sec * 1000
         )
         log.info("✅ 登录成功！正在保存 Cookie...")
