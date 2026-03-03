@@ -271,10 +271,23 @@ def crawl(config: dict, db_path: str, seen_ids: set) -> list:
 
     with sync_playwright() as p:
         # 首次尝试无头模式
-        browser = p.chromium.launch(
+        # 尝试使用系统 Chrome，回退到 Playwright 自带 Chromium
+        import shutil
+        chrome_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+        ]
+        chrome_bin = next((p for p in chrome_paths if shutil.os.path.exists(p)), None)
+        launch_kwargs = dict(
             headless=headless,
             args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
         )
+        if chrome_bin:
+            launch_kwargs["executable_path"] = chrome_bin
+            log.info(f"使用系统 Chrome: {chrome_bin}")
+        browser = p.chromium.launch(**launch_kwargs)
         context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="zh-CN",
