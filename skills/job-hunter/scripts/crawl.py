@@ -178,6 +178,17 @@ def parse_job_list(page, url: str, delay: float = 2) -> list:
     handle_security_check(page)
     time.sleep(delay)
 
+    log.info(f"当前页面 URL: {page.url}")
+    log.info(f"页面标题: {page.title()}")
+
+    # 截图保存
+    try:
+        os.makedirs("data", exist_ok=True)
+        page.screenshot(path="data/debug_screenshot.png")
+        log.info("截图已保存: data/debug_screenshot.png")
+    except Exception as e:
+        log.warning(f"截图失败: {e}")
+
     # 检查是否跳转到验证页
     handle_security_check(page)
 
