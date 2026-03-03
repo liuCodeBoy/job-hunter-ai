@@ -17,6 +17,9 @@ from crawl import crawl
 from analyze import batch_analyze
 from push import push_jobs, push_summary
 
+import os as _os
+_os.makedirs("data", exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",

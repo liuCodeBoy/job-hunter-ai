@@ -82,15 +82,23 @@ def save_cookies(driver, cookie_path):
 
 
 def find_chromedriver():
-    """查找 chromedriver，优先用项目根目录的"""
-    # 从当前脚本往上找 4 层到项目根目录
+    """查找 chromedriver，支持 macOS/Linux/Windows"""
+    import platform
     base = Path(__file__).resolve().parents[3]
+    is_win = platform.system() == "Windows"
+
+    # 候选路径（跨平台）
     candidates = [
-        base / "chromedriver.exe",
-        base / "chromedriver",
-        Path("chromedriver.exe"),
-        Path("chromedriver"),
+        base / ("chromedriver.exe" if is_win else "chromedriver"),
+        Path("chromedriver.exe" if is_win else "chromedriver"),
     ]
+    # macOS/Linux 还检查 PATH
+    if not is_win:
+        import shutil as _shutil
+        which = _shutil.which("chromedriver")
+        if which:
+            candidates.insert(0, Path(which))
+
     for p in candidates:
         if p.exists():
             log.info(f"使用 chromedriver: {p}")
@@ -99,46 +107,62 @@ def find_chromedriver():
 
 
 def create_driver():
+    import platform
+    import shutil
+
     options = uc.ChromeOptions()
     options.add_argument("--window-size=1280,800")
     options.add_argument("--lang=zh-CN")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     # 新版 Selenium 删掉了 ChromeOptions.headless 属性，但旧版 uc 内部会访问它
-    # 手动补上，避免 AttributeError
     if not hasattr(options, 'headless'):
         options.headless = False
 
-    # 完全跳过 uc 的网络检查，直接用本地 chromedriver
-    import undetected_chromedriver.patcher as patcher_mod
-    from distutils.version import LooseVersion
-    import shutil
-
-    # 找本地 chromedriver 路径
+    is_win = platform.system() == "Windows"
     driver_path = find_chromedriver()
-    uc_cache = os.path.join(os.path.expanduser("~"), "AppData", "Roaming", "undetected_chromedriver", "chromedriver.exe")
 
-    # patch auto() 直接跳过下载，用已有文件
-    def _patched_auto(self, executable=True, required_version=False, no_ssl=False):
-        # 如果缓存已有 chromedriver，直接 patch 后用
-        if os.path.exists(uc_cache):
-            self.executable_path = uc_cache
-            self.patch_exe()
-            return
-        # 否则用项目根目录的
-        if driver_path and os.path.exists(driver_path):
+    if driver_path:
+        # 有本地 chromedriver，patch uc 跳过下载
+        import undetected_chromedriver.patcher as patcher_mod
+
+        # uc 缓存路径（跨平台）
+        if is_win:
+            uc_cache = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
+                                    "undetected_chromedriver", "chromedriver.exe")
+        else:
+            uc_cache = os.path.join(os.path.expanduser("~"), ".local", "share",
+                                    "undetected_chromedriver", "chromedriver")
+
+        def _patched_auto(self, executable=True, required_version=False, no_ssl=False):
+            if os.path.exists(uc_cache):
+                self.executable_path = uc_cache
+                self.patch_exe()
+                return
             dst = uc_cache
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy(driver_path, dst)
             self.executable_path = dst
             self.patch_exe()
-            return
-        raise RuntimeError("找不到 chromedriver，请确保 chromedriver.exe 在项目根目录")
 
-    patcher_mod.Patcher.auto = _patched_auto
+        patcher_mod.Patcher.auto = _patched_auto
+
+    # 自动检测 Chrome major 版本
+    import subprocess as _sp, re as _re
+    try:
+        _r = _sp.run(
+            ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"],
+            capture_output=True, text=True, timeout=5
+        )
+        _major = int(_re.search(r"(\d+)\.", _r.stdout).group(1))
+    except Exception:
+        _major = None
+    log.info(f"Chrome major version: {_major}")
 
     driver = uc.Chrome(
         options=options,
         headless=False,
-        version_main=145,
+        version_main=_major,
     )
     return driver
 

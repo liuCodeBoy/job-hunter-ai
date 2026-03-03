@@ -3,6 +3,8 @@ push.py - 微信推送（PushPlus）
 将分析好的岗位格式化后推送到微信
 """
 
+from __future__ import annotations
+
 import json
 import logging
 import requests
