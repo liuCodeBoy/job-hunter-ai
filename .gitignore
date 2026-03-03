@@ -1,7 +1,29 @@
-config.yaml
-resume.md
-data/
+# ── 个人配置（含隐私信息，勿提交）──
+config.yaml          # 真实配置文件，含 PushPlus token 等
+resume.md            # 个人简历
+
+# ── 数据目录（运行时生成）──
+data/                # 含 jobs.db / cookies.json / boss_cookie.txt 等
+
+# ── 环境变量 ──
+.env
+.env.*
+
+# ── Python ──
 __pycache__/
 *.pyc
-.env
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# ── 日志 ──
 *.log
+
+# ── 系统文件 ──
+.DS_Store
+Thumbs.db
