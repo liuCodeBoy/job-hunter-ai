@@ -99,33 +99,35 @@ def save_cookies(context, cookie_path: str):
 
 
 def is_login_required(page) -> bool:
-    """检测是否需要登录"""
+    """检测是否需要登录（检查是否有用户登录态标识）"""
     try:
+        # 已登录则有用户头像或用户名
         page.wait_for_selector(
-            ".login-dialog, .sign-dialog, [class*='login-wrap']",
-            timeout=3000
+            ".nav-user-info, .user-nav, [class*='user-avatar'], .geek-nav",
+            timeout=4000
         )
-        return True
+        return False  # 找到了，说明已登录
     except PWTimeout:
-        return False
+        return True   # 没找到，说明未登录
 
 
-def wait_manual_login(page, context, cookie_path: str, timeout_sec: int = 120):
-    """等待用户手动扫码登录"""
+def wait_manual_login(page, context, cookie_path: str, timeout_sec: int = 180):
+    """等待用户手动登录（扫码或账号密码）"""
     log.warning("=" * 55)
-    log.warning("⚠️  需要登录 Boss直聘，请在弹出的浏览器窗口中扫码")
-    log.warning(f"   等待最多 {timeout_sec} 秒...")
+    log.warning("⚠️  请在弹出的浏览器窗口中登录 Boss直聘")
+    log.warning("   支持微信扫码 / 手机验证码 / 账号密码")
+    log.warning(f"   登录完成后程序自动继续，等待 {timeout_sec} 秒")
     log.warning("=" * 55)
     try:
         page.wait_for_selector(
-            ".user-nav, .nav-user-info, [class*='user-avatar'], .user-info",
+            ".nav-user-info, .user-nav, [class*='user-avatar'], .geek-nav",
             timeout=timeout_sec * 1000
         )
-        log.info("✅ 登录成功！")
+        log.info("✅ 登录成功！正在保存 Cookie...")
         save_cookies(context, cookie_path)
         time.sleep(2)
     except PWTimeout:
-        log.error("❌ 登录超时，请重新运行并及时扫码")
+        log.error("❌ 等待登录超时，请重新运行")
         raise RuntimeError("登录超时")
 
 
@@ -285,28 +287,32 @@ def crawl(config: dict, db_path: str, seen_ids: set) -> list:
         )
 
         # 访问首页检查登录状态
-        page.goto("https://www.zhipin.com/web/geek/job", wait_until="domcontentloaded")
-        time.sleep(2)
+        page.goto("https://www.zhipin.com/", wait_until="domcontentloaded")
+        time.sleep(3)
 
-        if is_login_required(page):
-            log.info("未检测到登录态，切换到有头模式等待扫码...")
-            browser.close()
-            browser = p.chromium.launch(headless=False, args=["--no-sandbox"])
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                locale="zh-CN",
-            )
-            if cookies:
-                context.add_cookies(cookies)
-            page = context.new_page()
-            page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-            )
-            page.goto("https://www.zhipin.com/web/geek/job", wait_until="domcontentloaded")
-            time.sleep(2)
+        if is_login_required(page) or not cookies:
+            log.info("未检测到登录态，等待手动登录...")
+            if headless:
+                # 切换有头模式
+                browser.close()
+                browser = p.chromium.launch(headless=False, args=["--no-sandbox"])
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    locale="zh-CN",
+                )
+                if cookies:
+                    context.add_cookies(cookies)
+                page = context.new_page()
+                page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+                )
+                page.goto("https://www.zhipin.com/", wait_until="domcontentloaded")
+                time.sleep(2)
 
-            if is_login_required(page):
-                wait_manual_login(page, context, cookie_path)
+            wait_manual_login(page, context, cookie_path)
+
+        # 登录后等一下让页面稳定
+        time.sleep(3)
 
         # ── 开始抓取 ──────────────────────────────────
         for keyword in search["keywords"]:
