@@ -1,0 +1,7 @@
+config.yaml
+resume.md
+data/
+__pycache__/
+*.pyc
+.env
+*.log
