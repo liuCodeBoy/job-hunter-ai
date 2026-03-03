@@ -140,17 +140,21 @@ def parse_job_list(page, url: str, delay: float = 2) -> list:
 
     time.sleep(delay)
 
-    # 滚动加载
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-    time.sleep(0.8)
-    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    time.sleep(0.8)
-
+    # 等待岗位列表加载
     try:
         page.wait_for_selector(".job-list-box", timeout=12000)
     except PWTimeout:
         log.warning(f"岗位列表未加载，可能需要登录或触发了风控: {url}")
         return jobs
+
+    # 滚动加载（页面稳定后再滚动）
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+        time.sleep(0.8)
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        time.sleep(0.8)
+    except Exception:
+        pass  # 滚动失败不影响数据抓取
 
     cards = page.query_selector_all(".job-list-box .job-card-wrapper")
     log.info(f"找到 {len(cards)} 个岗位卡片")
