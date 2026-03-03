@@ -129,32 +129,58 @@ def wait_manual_login(page, context, cookie_path: str, timeout_sec: int = 120):
         raise RuntimeError("登录超时")
 
 
+def handle_security_check(page, timeout_sec: int = 60):
+    """检测并等待用户处理滑块验证"""
+    if 'security' in page.url or 'passport' in page.url:
+        log.warning("=" * 50)
+        log.warning("⚠️  触发了 Boss直聘安全验证（滑块）")
+        log.warning("   请在浏览器窗口中手动拖动滑块完成验证")
+        log.warning(f"   等待最多 {timeout_sec} 秒...")
+        log.warning("=" * 50)
+        try:
+            # 等待跳转回正常页面
+            page.wait_for_url(
+                lambda url: 'security' not in url and 'passport' not in url,
+                timeout=timeout_sec * 1000
+            )
+            log.info("✅ 安全验证通过，继续抓取")
+            time.sleep(2)
+        except PWTimeout:
+            log.error("❌ 安全验证超时，跳过本次搜索")
+
+
 def parse_job_list(page, url: str, delay: float = 2) -> list:
     """解析岗位列表页"""
     jobs = []
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except Exception as e:
-        log.warning(f"页面加载失败: {e}")
-        return jobs
+        # 被跳转到验证页面时 goto 会抛异常，检查当前 URL
+        if 'security' in page.url or 'passport' in page.url:
+            handle_security_check(page)
+        else:
+            log.warning(f"页面加载失败: {e}")
+            return jobs
 
+    # 检查是否在验证页面
+    handle_security_check(page)
     time.sleep(delay)
 
-    # 等待岗位列表加载
+    # 先等岗位列表加载，再滚动
     try:
         page.wait_for_selector(".job-list-box", timeout=12000)
     except PWTimeout:
         log.warning(f"岗位列表未加载，可能需要登录或触发了风控: {url}")
         return jobs
 
-    # 滚动加载（页面稳定后再滚动）
+    # 滚动加载更多（页面稳定后）
     try:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
         time.sleep(0.8)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(0.8)
     except Exception:
-        pass  # 滚动失败不影响数据抓取
+        pass  # 滚动失败不影响已加载的数据
 
     cards = page.query_selector_all(".job-list-box .job-card-wrapper")
     log.info(f"找到 {len(cards)} 个岗位卡片")
