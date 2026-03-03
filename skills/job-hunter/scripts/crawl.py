@@ -1,28 +1,22 @@
 """
 crawl.py - Boss直聘岗位爬虫
-使用 undetected-chromedriver 绕过自动化检测
+通过 OpenClaw Browser 控制用户已登录的 Chrome 发 fetch 请求。
+
+运行方式：
+  本模块的 crawl() 需要传入一个 fetch_fn 回调（由 agent 注入）：
+    fetch_fn(url: str) -> dict
+
+  如果直接运行（agent 模式），请使用 agent_crawl() 替代，
+  它会通过 subprocess 调用 openclaw browser act。
 """
 
 import os
-import re
-import sys
 import time
 import json
-import yaml
 import logging
-from pathlib import Path
+import subprocess
+from urllib.parse import quote
 
-try:
-    import undetected_chromedriver as uc
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException
-except ImportError:
-    print("请先安装: pip install undetected-chromedriver selenium")
-    sys.exit(1)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 CITY_CODE = {
@@ -32,6 +26,9 @@ CITY_CODE = {
     "西安": "101110100", "苏州": "101190400", "厦门": "101230200",
     "重庆": "101040100", "天津": "101030100", "长沙": "101250100",
 }
+
+EXP_MAP  = {"不限": "", "应届": "102", "1-3年": "103", "3-5年": "104", "5-10年": "105"}
+DEG_MAP  = {"不限": "", "大专": "203", "本科": "204", "硕士": "205", "博士": "206"}
 
 
 def get_salary_code(min_k, max_k):
@@ -45,342 +42,132 @@ def get_salary_code(min_k, max_k):
 
 def build_search_url(keyword, city, salary_min, salary_max, experience, degree, page=1):
     city_code = CITY_CODE.get(city, "101020100")
-    salary_code = get_salary_code(salary_min, salary_max)
-    exp_map = {"不限": "", "应届": "102", "1-3年": "103", "3-5年": "104", "5-10年": "105"}
-    deg_map = {"不限": "", "大专": "203", "本科": "204", "硕士": "205", "博士": "206"}
-    params = [f"query={keyword}", f"city={city_code}", f"page={page}"]
-    if salary_code: params.append(f"salary={salary_code}")
-    if exp_map.get(experience): params.append(f"experience={exp_map[experience]}")
-    if deg_map.get(degree): params.append(f"degree={deg_map[degree]}")
-    return "https://www.zhipin.com/web/geek/job?" + "&".join(params)
-
-
-def extract_job_id(url):
-    match = re.search(r'/job_detail/([^/?\.]+)', url)
-    return match.group(1) if match else re.sub(r'[^a-zA-Z0-9]', '_', url)[-32:]
-
-
-def load_cookies(cookie_path):
-    if not cookie_path or not os.path.exists(cookie_path):
-        return []
-    try:
-        with open(cookie_path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def save_cookies(driver, cookie_path):
-    try:
-        cookies = driver.get_cookies()
-        os.makedirs(os.path.dirname(os.path.abspath(cookie_path)), exist_ok=True)
-        with open(cookie_path, "w", encoding="utf-8") as f:
-            json.dump(cookies, f, ensure_ascii=False, indent=2)
-        log.info(f"Cookie 已保存: {cookie_path}")
-    except Exception as e:
-        log.warning(f"保存 Cookie 失败: {e}")
-
-
-def find_chromedriver():
-    """查找 chromedriver，支持 macOS/Linux/Windows"""
-    import platform
-    base = Path(__file__).resolve().parents[3]
-    is_win = platform.system() == "Windows"
-
-    # 候选路径（跨平台）
-    candidates = [
-        base / ("chromedriver.exe" if is_win else "chromedriver"),
-        Path("chromedriver.exe" if is_win else "chromedriver"),
+    params = [
+        "scene=1",
+        f"query={quote(keyword)}",
+        f"city={city_code}",
+        f"page={page}",
+        "pageSize=15",
     ]
-    # macOS/Linux 还检查 PATH
-    if not is_win:
-        import shutil as _shutil
-        which = _shutil.which("chromedriver")
-        if which:
-            candidates.insert(0, Path(which))
-
-    for p in candidates:
-        if p.exists():
-            log.info(f"使用 chromedriver: {p}")
-            return str(p)
-    return None
+    sc = get_salary_code(salary_min, salary_max)
+    if sc: params.append(f"salary={sc}")
+    ec = EXP_MAP.get(experience, "")
+    if ec: params.append(f"experience={ec}")
+    dc = DEG_MAP.get(degree, "")
+    if dc: params.append(f"degree={dc}")
+    return "/wapi/zpgeek/search/joblist.json?" + "&".join(params)
 
 
-def create_driver():
-    import platform
-    import shutil
-
-    options = uc.ChromeOptions()
-    options.add_argument("--window-size=1280,800")
-    options.add_argument("--lang=zh-CN")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    # 新版 Selenium 删掉了 ChromeOptions.headless 属性，但旧版 uc 内部会访问它
-    if not hasattr(options, 'headless'):
-        options.headless = False
-
-    is_win = platform.system() == "Windows"
-    driver_path = find_chromedriver()
-
-    if driver_path:
-        # 有本地 chromedriver，patch uc 跳过下载
-        import undetected_chromedriver.patcher as patcher_mod
-
-        # uc 缓存路径（跨平台）
-        if is_win:
-            uc_cache = os.path.join(os.path.expanduser("~"), "AppData", "Roaming",
-                                    "undetected_chromedriver", "chromedriver.exe")
-        else:
-            uc_cache = os.path.join(os.path.expanduser("~"), ".local", "share",
-                                    "undetected_chromedriver", "chromedriver")
-
-        def _patched_auto(self, executable=True, required_version=False, no_ssl=False):
-            if os.path.exists(uc_cache):
-                self.executable_path = uc_cache
-                self.patch_exe()
-                return
-            dst = uc_cache
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            shutil.copy(driver_path, dst)
-            self.executable_path = dst
-            self.patch_exe()
-
-        patcher_mod.Patcher.auto = _patched_auto
-
-    # 自动检测 Chrome major 版本
-    import subprocess as _sp, re as _re
-    try:
-        _r = _sp.run(
-            ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"],
-            capture_output=True, text=True, timeout=5
-        )
-        _major = int(_re.search(r"(\d+)\.", _r.stdout).group(1))
-    except Exception:
-        _major = None
-    log.info(f"Chrome major version: {_major}")
-
-    driver = uc.Chrome(
-        options=options,
-        headless=False,
-        version_main=_major,
-    )
-    return driver
+def parse_job(raw):
+    tags = raw.get("skills", [])
+    return {
+        "id":          raw.get("encryptJobId", ""),
+        "title":       raw.get("jobName", ""),
+        "company":     raw.get("brandName", ""),
+        "salary":      raw.get("salaryDesc", ""),
+        "city":        raw.get("cityName", ""),
+        "experience":  raw.get("jobExperience", ""),
+        "degree":      raw.get("jobDegree", ""),
+        "description": "技术要求：" + "、".join(tags) if tags else "",
+        "url":         f"https://www.zhipin.com/job_detail/{raw.get('encryptJobId','')}.html",
+        "tags":        tags,
+    }
 
 
-def is_logged_in(driver):
-    """检测是否已登录"""
-    try:
-        WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR,
-                ".nav-user-info, .user-nav, .geek-nav, [class*='user-avatar']"))
-        )
-        return True
-    except TimeoutException:
-        return False
-
-
-def wait_login(driver, cookie_path, timeout=180):
-    """等待用户手动登录"""
-    driver.get("https://www.zhipin.com/web/user/?ka=header-login")
-    time.sleep(2)
-    log.warning("=" * 55)
-    log.warning("⚠️  请在浏览器窗口中登录 Boss直聘")
-    log.warning("   微信扫码 / 手机验证码 / 账号密码 均可")
-    log.warning(f"   登录完成后程序自动继续（等待 {timeout} 秒）")
-    log.warning("=" * 55)
-    end = time.time() + timeout
-    while time.time() < end:
-        if is_logged_in(driver):
-            log.info("✅ 登录成功！")
-            save_cookies(driver, cookie_path)
-            time.sleep(2)
-            return
-        time.sleep(2)
-    raise RuntimeError("登录超时，请重新运行")
-
-
-def apply_cookies(driver, cookies):
-    """注入已保存的 Cookie"""
-    driver.get("https://www.zhipin.com/")
-    time.sleep(2)
-    for ck in cookies:
-        try:
-            driver.add_cookie({k: ck[k] for k in ('name','value','domain','path') if k in ck})
-        except Exception:
-            pass
-    driver.refresh()
-    time.sleep(3)
-
-
-def warmup(driver):
-    """登录后模拟正常用户行为，减少风控"""
-    log.info("预热中（模拟正常浏览）...")
-    driver.get("https://www.zhipin.com/")
-    time.sleep(3)
-    driver.execute_script("window.scrollTo(0, 400)")
-    time.sleep(1.5)
-    driver.execute_script("window.scrollTo(0, 0)")
-    time.sleep(2)
-
-
-def parse_job_list(driver, url, delay=3):
-    """解析岗位列表页"""
-    jobs = []
-    driver.get(url)
-    time.sleep(delay)
-
-    # 截图调试
-    try:
-        os.makedirs("data", exist_ok=True)
-        driver.save_screenshot("data/debug_screenshot.png")
-    except Exception:
-        pass
-
-    log.info(f"当前URL: {driver.current_url[:80]}")
-
-    # 检查是否被跳转到风控/登录页
-    if any(x in driver.current_url for x in ['security', 'passport', 'login']):
-        log.warning("触发风控或需要登录，跳过本次搜索")
-        return jobs
-
-    try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".job-list-box"))
-        )
-    except TimeoutException:
-        log.warning(f"岗位列表未加载: {driver.current_url[:80]}")
-        return jobs
-
-    # 滚动加载
-    try:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2)")
-        time.sleep(1)
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1)
-    except Exception:
-        pass
-
-    cards = driver.find_elements(By.CSS_SELECTOR, ".job-list-box .job-card-wrapper")
-    log.info(f"找到 {len(cards)} 个岗位")
-
-    for card in cards:
-        try:
-            title   = card.find_element(By.CSS_SELECTOR, ".job-name").text.strip()
-            company = card.find_element(By.CSS_SELECTOR, ".company-name").text.strip()
-            salary  = card.find_element(By.CSS_SELECTOR, ".salary").text.strip()
-            link    = card.find_element(By.CSS_SELECTOR, "a.job-card-left")
-            href    = link.get_attribute("href") or ""
-            if not href.startswith("http"):
-                href = "https://www.zhipin.com" + href
-
-            tags = [el.text.strip() for el in card.find_elements(By.CSS_SELECTOR, ".job-info .tag-list li")]
-
-            jobs.append({
-                "id": extract_job_id(href),
-                "title": title, "company": company, "salary": salary,
-                "url": href, "tags": tags,
-                "experience": tags[0] if len(tags) > 0 else "",
-                "degree":     tags[1] if len(tags) > 1 else "",
-                "city": "", "description": "",
-            })
-        except NoSuchElementException:
-            continue
-
-    return jobs
-
-
-def parse_job_detail(driver, job, delay=2):
-    """抓取岗位详情"""
-    if not job.get("url"):
-        return job
-    try:
-        driver.get(job["url"])
-        time.sleep(delay)
-        try:
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".job-detail-section"))
-            )
-            job["description"] = driver.find_element(By.CSS_SELECTOR, ".job-detail-section").text.strip()
-        except TimeoutException:
-            job["description"] = ""
-        try:
-            job["city"] = driver.find_element(By.CSS_SELECTOR, ".job-detail-info .name").text.strip()
-        except Exception:
-            pass
-    except Exception as e:
-        log.warning(f"详情抓取失败: {e}")
-    return job
-
-
-def crawl(config, db_path, seen_ids):
+def crawl(config: dict, db_path: str, seen_ids: set, fetch_fn=None) -> list:
+    """
+    主爬取函数。
+    fetch_fn: callable(url) -> dict，由调用方注入（agent 直接传 browser fetch）
+    如果为 None，则尝试通过 subprocess 调用 openclaw browser act。
+    """
     search      = config["search"]
     crawler_cfg = config.get("crawler", {})
-    delay       = crawler_cfg.get("delay", 3)
+    delay       = crawler_cfg.get("delay", 2)
     max_jobs    = search.get("max_jobs", 15)
-    cookie_path = os.path.join(os.path.dirname(os.path.abspath(db_path)), "cookies.json")
+
+    if fetch_fn is None:
+        fetch_fn = _make_subprocess_fetch()
+
+    if fetch_fn is None:
+        log.error("❌ 无法获取 fetch 函数，请确保 OpenClaw Browser Relay 已连接 Boss直聘标签页")
+        return []
 
     new_jobs = []
-    driver = create_driver()
 
-    try:
-        cookies = load_cookies(cookie_path)
+    for keyword in search["keywords"]:
+        if len(new_jobs) >= max_jobs:
+            break
 
-        if cookies:
-            log.info(f"加载 {len(cookies)} 条历史 Cookie...")
-            apply_cookies(driver, cookies)
-            if not is_logged_in(driver):
-                log.info("Cookie 已过期，需要重新登录")
-                wait_login(driver, cookie_path)
-            else:
-                log.info("✅ Cookie 有效，已自动登录")
-        else:
-            wait_login(driver, cookie_path)
+        log.info(f"🔍 搜索: {keyword} | 城市: {search.get('city','上海')}")
+        url = build_search_url(
+            keyword=keyword,
+            city=search.get("city", "上海"),
+            salary_min=search.get("salary_min", 0),
+            salary_max=search.get("salary_max", 0),
+            experience=search.get("experience", "不限"),
+            degree=search.get("degree", "不限"),
+        )
 
-        warmup(driver)
+        time.sleep(delay)
+        data = fetch_fn(url)
 
-        for keyword in search["keywords"]:
+        if not data or data.get("code") != 0:
+            log.warning(f"搜索失败: {data.get('message','') if data else '无响应'}")
+            continue
+
+        job_list = data.get("zpData", {}).get("jobList", [])
+        log.info(f"  返回 {len(job_list)} 个岗位")
+
+        for raw in job_list:
             if len(new_jobs) >= max_jobs:
                 break
+            job = parse_job(raw)
+            if not job["id"] or job["id"] in seen_ids:
+                continue
+            log.info(f"  📄 {job['title']} @ {job['company']} ({job['salary']})")
+            new_jobs.append(job)
+            seen_ids.add(job["id"])
 
-            log.info(f"🔍 搜索: {keyword} | 城市: {search.get('city','上海')}")
-            url = build_search_url(
-                keyword=keyword,
-                city=search.get("city", "上海"),
-                salary_min=search.get("salary_min", 0),
-                salary_max=search.get("salary_max", 0),
-                experience=search.get("experience", "不限"),
-                degree=search.get("degree", "不限"),
-            )
-
-            jobs = parse_job_list(driver, url, delay=delay)
-
-            for job in jobs:
-                if len(new_jobs) >= max_jobs:
-                    break
-                if job["id"] in seen_ids:
-                    continue
-                log.info(f"📄 {job['title']} @ {job['company']} ({job['salary']})")
-                job = parse_job_detail(driver, job, delay=delay)
-                new_jobs.append(job)
-                seen_ids.add(job["id"])
-
-            time.sleep(delay)
-
-        save_cookies(driver, cookie_path)
-
-    finally:
-        driver.quit()
+        time.sleep(delay)
 
     log.info(f"✅ 抓取完成，新增 {len(new_jobs)} 个岗位")
     return new_jobs
 
 
-if __name__ == "__main__":
-    cfg_path = Path(__file__).parent.parent.parent.parent / "config.yaml"
-    if not cfg_path.exists():
-        cfg_path = cfg_path.with_name("config.example.yaml")
-    with open(cfg_path, encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    os.makedirs("data", exist_ok=True)
-    results = crawl(config, config["database"]["path"], set())
-    print(json.dumps(results[:2], ensure_ascii=False, indent=2))
+def _make_subprocess_fetch():
+    """
+    通过 openclaw browser act 发 fetch（subprocess 方式，用于独立运行）
+    需要 OpenClaw relay 已连接 Boss直聘 tab。
+    """
+    # 找 target_id
+    try:
+        import requests as _req
+        r = _req.get("http://127.0.0.1:18792/json", timeout=3)
+        tabs = r.json() if isinstance(r.json(), list) else []
+        target_id = next(
+            (t["id"] for t in tabs if "zhipin.com" in t.get("url", "")),
+            tabs[0]["id"] if tabs else None
+        )
+    except Exception:
+        target_id = None
+
+    if not target_id:
+        return None
+
+    def fetch_fn(url):
+        js = f"fetch('{url}',{{credentials:'include'}}).then(r=>r.json()).then(d=>JSON.stringify(d))"
+        result = subprocess.run(
+            ["openclaw", "browser", "act", "--profile", "chrome",
+             "--target", target_id, "--eval", js],
+            capture_output=True, text=True, timeout=20
+        )
+        if result.returncode != 0:
+            return {}
+        try:
+            raw = result.stdout.strip()
+            if raw.startswith('"'): raw = json.loads(raw)
+            return json.loads(raw)
+        except Exception:
+            return {}
+
+    return fetch_fn
